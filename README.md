@@ -80,8 +80,10 @@ mirror_host [--port 8765] [--tailscale-only] [--reset-code]
 - Jika jaringan Windows berstatus Public, izin firewall untuk jaringan Private
   tidak berlaku. Ubah jaringan ke Private, atau izinkan `mirror_host.exe` di
   Windows Security > Firewall > Allow an app through firewall.
-- Gambar patah-patah: pilih kualitas **Hemat data** di menu. Koneksi Tailscale
-  yang lewat relay (DERP) lebih lambat daripada koneksi langsung.
+- Gambar patah-patah: lihat statistik di jendela host. Kalau `latensi` terus di
+  atas 500 ms, pilih kualitas **Hemat data** di menu. Koneksi Tailscale yang
+  lewat relay (DERP) lebih lambat daripada koneksi langsung; jalankan
+  `tailscale status` di laptop dan pastikan HP tertulis `direct`, bukan `relay`.
 
 ## Build ulang
 
@@ -101,6 +103,16 @@ Test terhadap host yang sedang berjalan (kursor laptop akan bergeser sedikit):
 $env:MIRROR_E2E_PORT='8765'
 $env:MIRROR_E2E_CODE='KODE-PAIRING'
 flutter test test/host_e2e_test.dart
+```
+
+Mengukur kinerja tanpa HP. `net_sim` meniru jaringan lambat, misalnya 1 Mbps
+dengan delay 80 ms:
+
+```powershell
+cd host
+dart run tool/bench_capture.dart 1280 60
+dart run tool/net_sim.dart 18766 8765 1000 80
+dart run tool/smoke_client.dart 127.0.0.1 18766 KODE-PAIRING 12 move
 ```
 
 `kotlin.incremental=false` di `app/android/gradle.properties` diperlukan karena

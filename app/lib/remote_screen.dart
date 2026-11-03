@@ -349,7 +349,7 @@ class _ScreenPainter extends CustomPainter {
   _ScreenPainter(this.state) : super(repaint: state._repaint);
 
   final _RemoteScreenState state;
-  final Paint _paint = Paint()..filterQuality = FilterQuality.medium;
+  final Paint _paint = Paint()..filterQuality = FilterQuality.low;
 
   @override
   void paint(Canvas canvas, Size size) {

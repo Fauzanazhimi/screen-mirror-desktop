@@ -2,7 +2,7 @@ import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
 
-const protocolVersion = 1;
+const protocolVersion = 2;
 const defaultPort = 8765;
 
 /// Harus sama dengan implementasi di host/lib/auth.dart.

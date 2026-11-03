@@ -6,6 +6,8 @@ import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
+import 'dirty_rects.dart';
+import 'frame_message.dart';
 import 'win32.dart';
 
 const _pixelFormat32bppRgb = 0x00022009;
@@ -22,8 +24,9 @@ const _qualityGuid = <int>[
   0x9C, 0xDD, 0x5D, 0xB3, 0x51, 0x05, 0xE7, 0xEB,
 ];
 
-/// Ukuran header frame: posisi kursor X dan Y, masing-masing Uint16 (0-65535).
-const frameHeaderSize = 4;
+/// Saat layar diam, layar dicek ulang paling cepat setiap 50 ms agar CPU
+/// laptop tidak terus penuh membaca layar yang tidak berubah.
+const _idlePoll = Duration(milliseconds: 50);
 
 /// Mengambil layar utama lalu mengubahnya menjadi JPEG lewat GDI+.
 class ScreenGrabber {
@@ -78,8 +81,12 @@ class ScreenGrabber {
   int _width = 0;
   int _height = 0;
 
+  /// Diset bila patch gagal dikirim, agar frame berikutnya dikirim utuh.
+  bool _needFullFrame = true;
+
   void _ensureBuffer(int width, int height) {
     if (width == _width && height == _height) return;
+    _needFullFrame = true;
     _releaseBuffer();
     final info = calloc<BitmapInfoHeader>();
     info.ref
@@ -142,8 +149,9 @@ class ScreenGrabber {
     );
   }
 
-  /// Mengembalikan frame (header + JPEG), atau null bila layar tidak berubah
-  /// atau tidak bisa dibaca (mis. saat layar kunci atau prompt UAC tampil).
+  /// Mengembalikan pesan pembaruan berisi area yang berubah saja, atau null
+  /// bila layar tidak berubah atau tidak bisa dibaca (mis. saat layar kunci
+  /// atau prompt UAC tampil). [force] mengirim seluruh layar.
   Uint8List? grab({
     required int maxWidth,
     required int quality,
@@ -180,26 +188,50 @@ class ScreenGrabber {
     final (cursorX, cursorY) = _drawCursor(srcWidth, srcHeight);
 
     final byteCount = width * height * 4;
-    if (!force && memcmp(_bits, _previous, byteCount) == 0) return null;
+    final List<PixelRect> rects;
+    if (force || _needFullFrame) {
+      rects = [PixelRect(0, 0, width, height)];
+    } else {
+      if (memcmp(_bits, _previous, byteCount) == 0) return null;
+      rects = changedRects(
+        _bits.cast<Uint32>().asTypedList(width * height),
+        _previous.cast<Uint32>().asTypedList(width * height),
+        width,
+        height,
+      );
+      if (rects.isEmpty) return null;
+    }
     memcpy(_previous, _bits, byteCount);
 
-    return _encode(width, height, quality, cursorX, cursorY);
+    _qualityValue.value = quality;
+    final patches = <EncodedPatch>[];
+    for (final rect in rects) {
+      final jpeg = _encodeRegion(rect);
+      if (jpeg == null) {
+        _needFullFrame = true;
+        return null;
+      }
+      patches.add(EncodedPatch(rect, jpeg));
+    }
+    _needFullFrame = false;
+    return buildUpdate(
+      width: width,
+      height: height,
+      cursorX: cursorX,
+      cursorY: cursorY,
+      patches: patches,
+    );
   }
 
-  Uint8List? _encode(
-    int width,
-    int height,
-    int quality,
-    int cursorX,
-    int cursorY,
-  ) {
-    _qualityValue.value = quality;
+  /// Encode satu area langsung dari buffer DIB tanpa menyalin piksel.
+  Uint8List? _encodeRegion(PixelRect rect) {
+    final stride = _width * 4;
     if (gdipCreateBitmapFromScan0(
-          width,
-          height,
-          width * 4,
+          rect.width,
+          rect.height,
+          stride,
           _pixelFormat32bppRgb,
-          _bits,
+          _bits + (rect.y * stride + rect.x * 4),
           _outHandle,
         ) !=
         0) {
@@ -217,13 +249,9 @@ class ScreenGrabber {
     final memory = _outHandle.value;
     final data = globalLock(memory);
     if (data == nullptr) return null;
-    final frame = Uint8List(frameHeaderSize + size);
-    frame.setRange(frameHeaderSize, frame.length, data.asTypedList(size));
+    final jpeg = Uint8List.fromList(data.asTypedList(size));
     globalUnlock(memory);
-    ByteData.sublistView(frame)
-      ..setUint16(0, cursorX, Endian.big)
-      ..setUint16(2, cursorY, Endian.big);
-    return frame;
+    return jpeg;
   }
 
   void dispose() {
@@ -245,7 +273,8 @@ class ScreenGrabber {
   }
 }
 
-/// Pesan ke isolate: 'next' meminta satu frame; {w, q, fps} mengubah setelan.
+/// Pesan ke isolate: 'next' meminta satu pembaruan; 'full' meminta layar utuh;
+/// {w, q, fps} mengubah setelan; {q} hanya mengubah kualitas JPEG.
 ///
 /// Capture dan encode berjalan di isolate terpisah supaya pekerjaan FFI yang
 /// sinkron ini tidak menahan event loop jaringan dan input di isolate utama.
@@ -277,7 +306,7 @@ void captureIsolate(SendPort toMain) {
       force: force,
     );
     if (frame == null) {
-      timer = Timer(interval, tick);
+      timer = Timer(interval > _idlePoll ? interval : _idlePoll, tick);
       return;
     }
     pending = false;
@@ -286,13 +315,18 @@ void captureIsolate(SendPort toMain) {
   }
 
   port.listen((message) {
-    if (message == 'next') {
-      pending = true;
-    } else if (message is Map) {
-      maxWidth = message['w'] as int;
-      quality = message['q'] as int;
-      interval = Duration(milliseconds: 1000 ~/ (message['fps'] as int));
-      force = true;
+    switch (message) {
+      case 'next':
+        pending = true;
+      case 'full':
+        force = true;
+      case {'w': int w, 'q': int q, 'fps': int fps}:
+        maxWidth = w;
+        quality = q;
+        interval = Duration(milliseconds: 1000 ~/ fps);
+        force = true;
+      case {'q': int q}:
+        quality = q;
     }
     if (pending && timer == null) tick();
   });

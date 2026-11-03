@@ -3,6 +3,8 @@
 // Catatan: test ini menggeser kursor laptop sedikit.
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
+import 'dart:ui' as ui;
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mirror_remote/mirror_client.dart';
@@ -33,6 +35,31 @@ void main() {
       }
     };
     return result.future.timeout(const Duration(seconds: 10));
+  }
+
+  /// Rata-rata selisih warna (0-255) dua gambar di kotak sekitar [center].
+  Future<double> regionDifference(
+    ui.Image a,
+    ui.Image b,
+    ui.Offset center,
+  ) async {
+    const half = 40;
+    final pixelsA = (await a.toByteData())!;
+    final pixelsB = (await b.toByteData())!;
+    final cx = (center.dx * a.width).round();
+    final cy = (center.dy * a.height).round();
+    var total = 0;
+    var count = 0;
+    for (var y = max(0, cy - half); y < min(a.height, cy + half); y++) {
+      for (var x = max(0, cx - half); x < min(a.width, cx + half); x++) {
+        final i = (y * a.width + x) * 4;
+        for (var c = 0; c < 3; c++) {
+          total += (pixelsA.getUint8(i + c) - pixelsB.getUint8(i + c)).abs();
+          count++;
+        }
+      }
+    }
+    return total / count;
   }
 
   testWidgets('kode salah ditolak', (tester) async {
@@ -94,6 +121,47 @@ void main() {
       );
       moved.image.dispose();
       client.moveBy(-dx, 0);
+      client.close();
+    });
+  }, skip: skip);
+
+  testWidgets('kursor bergerak: pembaruan kecil dan tempelan patch akurat', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      HttpOverrides.global = null;
+      final client = await MirrorClient.connect(params());
+      final first = await nextFrame(client, (_) => true);
+      final start = first.cursor;
+      first.image.dispose();
+
+      final dx = start.dx > 0.5 ? -120 : 120;
+      client.moveBy(dx, 0);
+      final moved = await nextFrame(
+        client,
+        (f) => (f.cursor.dx - start.dx).abs() > 0.02,
+      );
+      expect(moved.bytes, lessThan(30 * 1024), reason: 'hanya area kursor');
+
+      // Sesi baru selalu dimulai dengan layar utuh: pembanding yang jujur.
+      final fresh = await MirrorClient.connect(params());
+      final full = await nextFrame(fresh, (_) => true);
+      expect(full.image.width, moved.image.width);
+      expect(
+        await regionDifference(moved.image, full.image, moved.cursor),
+        lessThan(8),
+        reason: 'kursor di posisi baru harus tampil sama',
+      );
+      expect(
+        await regionDifference(moved.image, full.image, start),
+        lessThan(8),
+        reason: 'bekas posisi kursor lama harus kembali bersih',
+      );
+
+      moved.image.dispose();
+      full.image.dispose();
+      fresh.moveBy(-dx, 0);
+      fresh.close();
       client.close();
     });
   }, skip: skip);

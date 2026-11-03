@@ -1,13 +1,18 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'frame_update.dart';
 import 'protocol.dart';
 
-const _frameHeaderSize = 4;
 const _connectTimeout = Duration(seconds: 8);
+
+// Pong dari laptop bisa tertahan di belakang frame pada jaringan lambat.
+// Batas yang terlalu pendek memutus koneksi yang sebenarnya masih hidup.
+const _pingInterval = Duration(seconds: 15);
 
 class ConnectionParams {
   const ConnectionParams({
@@ -31,12 +36,14 @@ class MirrorConnectException implements Exception {
   String toString() => message;
 }
 
-/// Satu frame layar. [cursor] ternormalisasi 0..1.
+/// Satu frame layar utuh. [cursor] ternormalisasi 0..1. [bytes] adalah ukuran
+/// pesan pembaruan yang menghasilkan frame ini.
 class MirrorFrame {
-  const MirrorFrame(this.image, this.cursor);
+  const MirrorFrame(this.image, this.cursor, {this.bytes = 0});
 
   final ui.Image image;
   final ui.Offset cursor;
+  final int bytes;
 }
 
 class MirrorClient {
@@ -51,8 +58,13 @@ class MirrorClient {
 
   final Completer<void> _ready = Completer<void>();
   bool _closed = false;
-  bool _decoding = false;
-  Uint8List? _nextFrame;
+
+  // Pembaruan hanya berisi area yang berubah, jadi tidak boleh ada yang
+  // dilewati: semuanya diproses berurutan di atas gambar layar terakhir.
+  final Queue<Uint8List> _pending = Queue();
+  bool _processing = false;
+  ui.Image? _screen;
+  bool _fullRequested = false;
 
   static Future<MirrorClient> connect(ConnectionParams params) async {
     final WebSocket socket;
@@ -84,7 +96,7 @@ class MirrorClient {
       throw const MirrorConnectException('Alamat laptop tidak valid.');
     }
 
-    socket.pingInterval = const Duration(seconds: 5);
+    socket.pingInterval = _pingInterval;
     final client = MirrorClient._(socket);
     client._listen(params.code);
     try {
@@ -154,49 +166,111 @@ class MirrorClient {
   }
 
   void _onBinary(Uint8List data) {
-    if (data.length <= _frameHeaderSize) return;
-    if (_decoding) {
-      // Dekoder tertinggal: frame lama dibuang agar tampilan tidak tertunda.
-      if (_nextFrame != null) _ack();
-      _nextFrame = data;
+    _pending.add(data);
+    if (!_processing) unawaited(_processPending());
+  }
+
+  Future<void> _processPending() async {
+    _processing = true;
+    while (_pending.isNotEmpty && !_closed) {
+      await _apply(_pending.removeFirst());
+      _ack();
+    }
+    _processing = false;
+  }
+
+  Future<void> _apply(Uint8List data) async {
+    final FrameUpdate update;
+    try {
+      update = parseUpdate(data);
+    } on FormatException {
+      _requestFullFrame();
       return;
     }
-    unawaited(_decodeFrames(data));
-  }
 
-  Future<void> _decodeFrames(Uint8List first) async {
-    _decoding = true;
-    Uint8List? current = first;
-    while (current != null && !_closed) {
-      await _decode(current);
-      _ack();
-      current = _nextFrame;
-      _nextFrame = null;
-    }
-    _decoding = false;
-  }
-
-  Future<void> _decode(Uint8List data) async {
-    final header = ByteData.sublistView(data, 0, _frameHeaderSize);
-    final cursor = ui.Offset(
-      header.getUint16(0) / 65535,
-      header.getUint16(2) / 65535,
-    );
+    final images = <ui.Image>[];
     try {
-      final codec = await ui.instantiateImageCodec(
-        Uint8List.sublistView(data, _frameHeaderSize),
-      );
-      final decoded = await codec.getNextFrame();
-      codec.dispose();
-      final handler = onFrame;
-      if (_closed || handler == null) {
-        decoded.image.dispose();
-        return;
+      for (final patch in update.patches) {
+        images.add(await _decodeJpeg(patch.jpeg));
       }
-      handler(MirrorFrame(decoded.image, cursor));
     } on Exception {
-      // Satu frame rusak tidak perlu memutus sesi; frame berikutnya menyusul.
+      // Patch rusak: gambar di HP tidak lagi sama dengan laptop, minta utuh.
+      for (final image in images) {
+        image.dispose();
+      }
+      _requestFullFrame();
+      return;
     }
+    if (_closed) {
+      for (final image in images) {
+        image.dispose();
+      }
+      return;
+    }
+
+    final ui.Image screen;
+    final previous = _screen;
+    if (update.isFullFrame) {
+      screen = images.single;
+      _fullRequested = false;
+    } else if (previous == null ||
+        previous.width != update.width ||
+        previous.height != update.height) {
+      for (final image in images) {
+        image.dispose();
+      }
+      _requestFullFrame();
+      return;
+    } else {
+      screen = _composite(previous, update, images);
+    }
+    previous?.dispose();
+    _screen = screen;
+
+    final handler = onFrame;
+    if (handler != null) {
+      handler(MirrorFrame(screen.clone(), update.cursor, bytes: data.length));
+    }
+  }
+
+  /// Menempel patch di atas gambar layar terakhir, sepenuhnya di GPU.
+  ui.Image _composite(
+    ui.Image previous,
+    FrameUpdate update,
+    List<ui.Image> patches,
+  ) {
+    final recorder = ui.PictureRecorder();
+    final canvas = ui.Canvas(recorder);
+    final paint = ui.Paint();
+    canvas.drawImage(previous, ui.Offset.zero, paint);
+    for (var i = 0; i < patches.length; i++) {
+      final patch = update.patches[i];
+      canvas.drawImage(
+        patches[i],
+        ui.Offset(patch.x.toDouble(), patch.y.toDouble()),
+        paint,
+      );
+      patches[i].dispose();
+    }
+    final picture = recorder.endRecording();
+    final image = picture.toImageSync(update.width, update.height);
+    picture.dispose();
+    return image;
+  }
+
+  Future<ui.Image> _decodeJpeg(Uint8List jpeg) async {
+    final codec = await ui.instantiateImageCodec(jpeg);
+    try {
+      return (await codec.getNextFrame()).image;
+    } finally {
+      codec.dispose();
+    }
+  }
+
+  void _requestFullFrame() {
+    if (_fullRequested) return;
+    _fullRequested = true;
+    _sendJson({'t': 'full'});
   }
 
   void _ack() => _sendJson({'t': 'ack'});
@@ -230,6 +304,9 @@ class MirrorClient {
   void close() {
     if (_closed) return;
     _closed = true;
+    _pending.clear();
+    _screen?.dispose();
+    _screen = null;
     unawaited(_socket.close());
   }
 }

@@ -1,16 +1,27 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
 
+import 'adaptive_quality.dart';
 import 'auth.dart';
 import 'input_injector.dart';
 import 'screen_capture.dart';
 
-const protocolVersion = 1;
+const protocolVersion = 2;
 const _authTimeout = Duration(seconds: 10);
-const _pingInterval = Duration(seconds: 5);
+
+// Ping ikut mengantre di belakang frame. Batas yang terlalu pendek membuat
+// koneksi lambat diputus padahal masih hidup.
+const _pingInterval = Duration(seconds: 15);
+
+// Frame kedua hanya dikirim selagi frame yang masih di jalan berukuran kecil,
+// agar gambar tidak menumpuk di jaringan lambat dan tampil makin tertinggal.
 const _maxFramesInFlight = 2;
+const _maxBytesInFlight = 48 * 1024;
+
+const _statsInterval = Duration(seconds: 5);
 const _maxTextLength = 4096;
 
 class MirrorServer {
@@ -24,6 +35,8 @@ class MirrorServer {
   late final SendPort _capture;
   _Session? _active;
   bool _frameRequested = false;
+  final AdaptiveQuality _quality = AdaptiveQuality();
+  Timer? _statsTimer;
 
   Future<void> start(List<InternetAddress> addresses, int port) async {
     await _startCapture();
@@ -68,9 +81,43 @@ class MirrorServer {
   void _requestFrame() {
     final session = _active;
     if (session == null || _frameRequested) return;
-    if (session.framesInFlight >= _maxFramesInFlight) return;
+    final inFlight = session.inFlight;
+    if (inFlight.length >= _maxFramesInFlight) return;
+    if (inFlight.isNotEmpty && session.bytesInFlight > _maxBytesInFlight) {
+      return;
+    }
     _frameRequested = true;
     _capture.send('next');
+  }
+
+  void _onAck(Duration latency) {
+    if (_quality.addSample(latency)) {
+      _capture.send({'q': _quality.quality});
+    }
+    _requestFrame();
+  }
+
+  void _configure(int width, int quality, int fps) {
+    _quality.reset(quality);
+    _capture.send({'w': width, 'q': quality, 'fps': fps});
+  }
+
+  void _printStats() {
+    final session = _active;
+    if (session == null) return;
+    final seconds = _statsInterval.inMilliseconds / 1000;
+    final frames = session.framesSent;
+    final kb = session.bytesSent / 1024;
+    final latency = _quality.averageLatencyMs;
+    print(
+      '  ${(frames / seconds).toStringAsFixed(1)} fps'
+      ' | ${frames == 0 ? 0 : (kb / frames).toStringAsFixed(1)} KB/frame'
+      ' | ${(kb * 8 / 1024 / seconds).toStringAsFixed(2)} Mbps'
+      ' | latensi ${latency == null ? '-' : latency.round()} ms'
+      ' | kualitas ${_quality.quality}',
+    );
+    session.framesSent = 0;
+    session.bytesSent = 0;
   }
 
   Future<void> _onRequest(HttpRequest request) async {
@@ -109,12 +156,16 @@ class MirrorServer {
     _active = session;
     _frameRequested = false;
     _throttle.recordSuccess(session.address);
+    _statsTimer?.cancel();
+    _statsTimer = Timer.periodic(_statsInterval, (_) => _printStats());
     print('[${_time()}] Terhubung: ${session.address}');
   }
 
   void _deactivate(_Session session) {
     if (!identical(_active, session)) return;
     _active = null;
+    _statsTimer?.cancel();
+    _statsTimer = null;
     _input.releaseAll();
     print('[${_time()}] Terputus: ${session.address}');
   }
@@ -130,7 +181,11 @@ class _Session {
   final String address;
   final String nonce = generateNonce();
 
-  int framesInFlight = 0;
+  /// Waktu kirim dan ukuran setiap frame yang belum di-ack, urut pengiriman.
+  final Queue<(Stopwatch, int)> inFlight = Queue();
+  int bytesInFlight = 0;
+  int framesSent = 0;
+  int bytesSent = 0;
   bool _authed = false;
   bool _closed = false;
 
@@ -179,7 +234,7 @@ class _Session {
     _authed = true;
     server._activate(this);
     _sendJson({'t': 'ok', 'name': Platform.localHostname});
-    server._capture.send({'w': 1280, 'q': 60, 'fps': 30});
+    server._configure(1280, 60, 30);
     server._requestFrame();
   }
 
@@ -187,14 +242,18 @@ class _Session {
     final input = server._input;
     switch (message) {
       case {'t': 'ack'}:
-        if (framesInFlight > 0) framesInFlight--;
-        server._requestFrame();
+        if (inFlight.isEmpty) return;
+        final (sentAt, bytes) = inFlight.removeFirst();
+        bytesInFlight -= bytes;
+        server._onAck(sentAt.elapsed);
+      case {'t': 'full'}:
+        server._capture.send('full');
       case {'t': 'cfg', 'w': int w, 'q': int q, 'fps': int fps}:
-        server._capture.send({
-          'w': w.clamp(320, 3840),
-          'q': q.clamp(10, 95),
-          'fps': fps.clamp(1, 60),
-        });
+        server._configure(
+          w.clamp(320, 3840),
+          q.clamp(AdaptiveQuality.minQuality, 95),
+          fps.clamp(1, 60),
+        );
       case {'t': 'abs', 'x': num x, 'y': num y}:
         input.moveTo(x.toDouble(), y.toDouble());
       case {'t': 'rel', 'dx': int dx, 'dy': int dy}:
@@ -214,7 +273,10 @@ class _Session {
 
   void send(List<int> frame) {
     if (_closed) return;
-    framesInFlight++;
+    inFlight.add((Stopwatch()..start(), frame.length));
+    bytesInFlight += frame.length;
+    framesSent++;
+    bytesSent += frame.length;
     socket.add(frame);
   }
 
