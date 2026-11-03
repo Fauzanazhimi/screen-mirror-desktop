@@ -72,6 +72,27 @@ mirror_host [--port 8765] [--tailscale-only] [--reset-code]
 - Ctrl+Alt+Del tidak bisa dikirim.
 - Hanya satu HP yang tersambung dalam satu waktu; koneksi baru menggantikan yang
   lama.
+- Membaca layar lewat GDI memakan ~35-45 ms per frame, jadi gambar maksimal
+  sekitar 20 fps.
+- Di jaringan sangat lambat (~1 Mbps), perubahan seluruh layar seperti video
+  atau scroll panjang tetap tertinggal sekitar 1 detik.
+- Aplikasi HP dan `mirror_host.exe` harus versi yang sama. Versi berbeda akan
+  ditolak dengan pesan "Versi host dan aplikasi tidak cocok".
+
+## Cara gambar dikirim
+
+Host hanya mengirim petak 32×32 piksel yang berubah sejak frame sebelumnya,
+lalu aplikasi menempelkannya di atas gambar terakhir. Menggeser kursor cukup
+mengirim beberapa KB, bukan seluruh layar. Kualitas JPEG turun otomatis saat
+frame mulai mengantre di jaringan, lalu naik lagi saat lancar.
+
+Selama HP tersambung, jendela host menampilkan statistik setiap 5 detik:
+
+```
+  9.7 fps | 3.4 KB/frame | 0.27 Mbps | latensi 105 ms | kualitas 60
+```
+
+`latensi` adalah waktu dari frame dikirim sampai HP selesai menampilkannya.
 
 ## Kalau gagal terhubung
 
