@@ -8,12 +8,14 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 
 import 'mirror_client.dart';
 import 'protocol.dart';
+import 'tab_switch_buttons.dart';
 import 'text_diff.dart';
 import 'touch_interpreter.dart';
 import 'viewport.dart';
 
 const _presetKey = 'preset';
 const _modeKey = 'mode';
+const _tabButtonsKey = 'tabButtons';
 const _touchpadSensitivity = 2.0;
 const _scrollSensitivity = 3.0;
 const _reconnectAttempts = 15;
@@ -50,6 +52,7 @@ class _RemoteScreenState extends State<RemoteScreen> implements TouchActions {
   Offset _scrollRemainder = Offset.zero;
   bool _menuOpen = false;
   bool _keysOpen = false;
+  bool _tabButtonsVisible = true;
   bool _reconnecting = false;
   bool _disconnected = false;
   bool _leaving = false;
@@ -77,6 +80,7 @@ class _RemoteScreenState extends State<RemoteScreen> implements TouchActions {
       _touch.mode =
           TouchMode.values.asNameMap()[prefs.getString(_modeKey)] ??
           TouchMode.touchpad;
+      _tabButtonsVisible = prefs.getBool(_tabButtonsKey) ?? true;
     });
     _client.setQuality(_preset);
   }
@@ -230,6 +234,13 @@ class _RemoteScreenState extends State<RemoteScreen> implements TouchActions {
     await prefs.setString(_modeKey, next.name);
   }
 
+  Future<void> _toggleTabButtons() async {
+    final visible = !_tabButtonsVisible;
+    setState(() => _tabButtonsVisible = visible);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_tabButtonsKey, visible);
+  }
+
   @override
   Widget build(BuildContext context) {
     final isTouchpad = _touch.mode == TouchMode.touchpad;
@@ -285,6 +296,15 @@ class _RemoteScreenState extends State<RemoteScreen> implements TouchActions {
               bottom: 0,
               child: _KeyBar(onCombo: (keys) => _client.combo(keys)),
             ),
+          if (_tabButtonsVisible)
+            Positioned(
+              left: 8,
+              // Naik di atas baris tombol khusus bila sedang terbuka.
+              bottom: _keysOpen ? 56 : 8,
+              child: SafeArea(
+                child: TabSwitchButtons(onCombo: (keys) => _client.combo(keys)),
+              ),
+            ),
           Positioned(
             top: 8,
             right: 8,
@@ -293,11 +313,13 @@ class _RemoteScreenState extends State<RemoteScreen> implements TouchActions {
                 open: _menuOpen,
                 isTouchpad: isTouchpad,
                 keysOpen: _keysOpen,
+                tabButtonsVisible: _tabButtonsVisible,
                 preset: _preset,
                 onToggleMenu: () => setState(() => _menuOpen = !_menuOpen),
                 onToggleMode: _toggleMode,
                 onToggleKeyboard: _toggleKeyboard,
                 onToggleKeys: () => setState(() => _keysOpen = !_keysOpen),
+                onToggleTabButtons: _toggleTabButtons,
                 onResetZoom: () {
                   _viewport.reset();
                   _repaint.value++;
@@ -372,11 +394,13 @@ class _Toolbar extends StatelessWidget {
     required this.open,
     required this.isTouchpad,
     required this.keysOpen,
+    required this.tabButtonsVisible,
     required this.preset,
     required this.onToggleMenu,
     required this.onToggleMode,
     required this.onToggleKeyboard,
     required this.onToggleKeys,
+    required this.onToggleTabButtons,
     required this.onResetZoom,
     required this.onPreset,
     required this.onDisconnect,
@@ -385,11 +409,13 @@ class _Toolbar extends StatelessWidget {
   final bool open;
   final bool isTouchpad;
   final bool keysOpen;
+  final bool tabButtonsVisible;
   final QualityPreset preset;
   final VoidCallback onToggleMenu;
   final VoidCallback onToggleMode;
   final VoidCallback onToggleKeyboard;
   final VoidCallback onToggleKeys;
+  final VoidCallback onToggleTabButtons;
   final VoidCallback onResetZoom;
   final ValueChanged<QualityPreset> onPreset;
   final VoidCallback onDisconnect;
@@ -420,6 +446,14 @@ class _Toolbar extends StatelessWidget {
               isSelected: keysOpen,
               onPressed: onToggleKeys,
               icon: const Icon(Icons.keyboard_command_key),
+            ),
+            IconButton(
+              tooltip: tabButtonsVisible
+                  ? 'Sembunyikan tombol pindah tab'
+                  : 'Tampilkan tombol pindah tab',
+              isSelected: tabButtonsVisible,
+              onPressed: onToggleTabButtons,
+              icon: const Icon(Icons.tab),
             ),
             IconButton(
               tooltip: 'Reset zoom',
@@ -462,6 +496,8 @@ class _KeyBar extends StatelessWidget {
     ('Esc', [Vk.esc]),
     ('Tab', [Vk.tab]),
     ('Alt+Tab', [Vk.alt, Vk.tab]),
+    ('Ctrl+Tab', nextTabKeys),
+    ('Ctrl+Shift+Tab', previousTabKeys),
     ('Win', [Vk.win]),
     ('Win+D', [Vk.win, Vk.keyD]),
     ('Ctrl+C', [Vk.ctrl, Vk.keyC]),

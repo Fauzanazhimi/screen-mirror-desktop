@@ -42,7 +42,13 @@ berada di Wi-Fi yang sama.
 | Cubit | Zoom | Zoom |
 
 Tombol `...` di kanan atas membuka menu: ganti mode, keyboard, tombol khusus
-(Esc, Alt+Tab, Ctrl+C, panah, dan lainnya), reset zoom, kualitas, dan putuskan.
+(Esc, Alt+Tab, Ctrl+C, panah, dan lainnya), tampilkan/sembunyikan tombol pindah
+tab, reset zoom, kualitas, dan putuskan.
+
+Tombol **‹ Tab** dan **Tab ›** di kiri bawah memindahkan ke tab sebelumnya dan
+berikutnya (Ctrl+Shift+Tab dan Ctrl+Tab) tanpa perlu menggeser kursor ke deretan
+tab. Berlaku di Chrome, Edge, VS Code, File Explorer, dan sebagian besar aplikasi
+bertab.
 
 ## Keamanan
 

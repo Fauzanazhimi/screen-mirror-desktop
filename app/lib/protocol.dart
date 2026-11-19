@@ -32,6 +32,7 @@ abstract final class Vk {
   static const backspace = 0x08;
   static const tab = 0x09;
   static const enter = 0x0D;
+  static const shift = 0x10;
   static const ctrl = 0x11;
   static const alt = 0x12;
   static const esc = 0x1B;
